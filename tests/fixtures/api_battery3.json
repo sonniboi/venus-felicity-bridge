@@ -1,0 +1,226 @@
+{
+  "AlarmRaw": {
+    "unit": "",
+    "value": 0
+  },
+  "AlarmStatus": {
+    "unit": "",
+    "value": "None"
+  },
+  "BMSTemperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "BMSUptime": {
+    "unit": "h",
+    "value": 1493
+  },
+  "BMSVersion": {
+    "unit": "",
+    "value": 524
+  },
+  "BatteryCurrent": {
+    "unit": "A",
+    "value": -12.6
+  },
+  "BatteryModel": {
+    "unit": "",
+    "value": "FLA48460TG2-EU"
+  },
+  "BatteryVoltage": {
+    "unit": "V",
+    "value": 53.07
+  },
+  "Cell1 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell10 Voltage": {
+    "unit": "V",
+    "value": 3.317
+  },
+  "Cell11 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell12 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell13 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell14 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell15 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell16 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell2 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell3 Voltage": {
+    "unit": "V",
+    "value": 3.317
+  },
+  "Cell4 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell5 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "Cell6 Voltage": {
+    "unit": "V",
+    "value": 3.315
+  },
+  "Cell7 Voltage": {
+    "unit": "V",
+    "value": 3.317
+  },
+  "Cell8 Voltage": {
+    "unit": "V",
+    "value": 3.317
+  },
+  "Cell9 Voltage": {
+    "unit": "V",
+    "value": 3.316
+  },
+  "CellVoltageDelta": {
+    "unit": "mV",
+    "value": 3
+  },
+  "ChargeCurrentLimit": {
+    "unit": "A",
+    "value": 250.0
+  },
+  "ChargeEnabled": {
+    "unit": "",
+    "value": "Yes"
+  },
+  "ChargeImmediately": {
+    "unit": "",
+    "value": "No"
+  },
+  "ChargeVoltageLimit": {
+    "unit": "V",
+    "value": 57.6
+  },
+  "CycleCount": {
+    "unit": "cycles",
+    "value": 19
+  },
+  "DischargeCurrentLimit": {
+    "unit": "A",
+    "value": 250.0
+  },
+  "DischargeEnabled": {
+    "unit": "",
+    "value": "Yes"
+  },
+  "DischargeVoltageLimit": {
+    "unit": "V",
+    "value": 48.0
+  },
+  "FaultCode": {
+    "unit": "",
+    "value": 0
+  },
+  "FaultCodeText": {
+    "unit": "",
+    "value": "None"
+  },
+  "FaultRaw": {
+    "unit": "",
+    "value": 0
+  },
+  "FaultStatus": {
+    "unit": "",
+    "value": "None"
+  },
+  "FirmwareBuild": {
+    "unit": "",
+    "value": 3386
+  },
+  "MCU2Version": {
+    "unit": "",
+    "value": 8
+  },
+  "MOSTemperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "MaxCellTemperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "MaxCellTemperatureId": {
+    "unit": "",
+    "value": 1
+  },
+  "MaxCellVoltage": {
+    "unit": "V",
+    "value": 3.317
+  },
+  "MaxCellVoltageId": {
+    "unit": "",
+    "value": 7
+  },
+  "MinCellTemperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "MinCellTemperatureId": {
+    "unit": "",
+    "value": 1
+  },
+  "MinCellVoltage": {
+    "unit": "V",
+    "value": 3.315
+  },
+  "MinCellVoltageId": {
+    "unit": "",
+    "value": 6
+  },
+  "RatedCapacity": {
+    "unit": "Ah",
+    "value": 460
+  },
+  "SOC": {
+    "unit": "%",
+    "value": 68
+  },
+  "SOH": {
+    "unit": "%",
+    "value": 100.0
+  },
+  "Sensor1 Temperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "Sensor2 Temperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "Sensor3 Temperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "Sensor4 Temperature": {
+    "unit": "°C",
+    "value": 23
+  },
+  "SerialNumber": {
+    "unit": "",
+    "value": "SERIAL-PACK-3"
+  }
+}
