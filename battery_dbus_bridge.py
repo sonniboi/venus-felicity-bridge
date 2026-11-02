@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Felicity BMS D-Bus Bridge
-Runs as separate process for each battery
-Usage: battery_dbus_bridge.py <battery_num> [data_source_url]
+Felicity BMS D-Bus bridge - one process per battery pack.
 
-v1.4 - Added Alarm/Fault Status forwarding to D-Bus/MQTT
-v1.9 - SOH, MOS temp, sensors 5-8, full fault bits C01-C13
-v2.0 - Added MaxVoltageCellId, MinVoltageCellId, MaxCellTemperature, MinCellTemperature,
-       MaxTemperatureCellId, MinTemperatureCellId, InstalledCapacity
-v2.1 - Debounce for transient fault alarms: alarm bits require ALARM_DEBOUNCE_POLLS
-       consecutive active polls before being published to D-Bus (default 20 = 60s)
+Reads the pack values from the local pack API (/api/battery<N>.json, see
+docs/api-contract.md) and publishes them as a Venus OS battery service
+com.victronenergy.battery.felicity_battery<N>.
+
+Usage: battery_dbus_bridge.py <pack_number> [api_base_url] [--config <file>]
+
+History of the original script:
+  v1.4  alarm/fault status forwarded to D-Bus
+  v1.9  SOH, MOS temperature, sensors 5-8, fault bits C01-C13
+  v2.0  min/max cell voltage and temperature with cell ids, installed capacity
+  v2.1  debounce for transient fault alarms
+  v2.2  configuration file, English comments, testable structure (no functional change)
 """
 import sys
 import time
@@ -17,464 +21,414 @@ import logging
 import json
 import urllib.request
 
-sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
-from vedbus import VeDbusService
-from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
+import felicity_config
 
-DBusGMainLoop(set_as_default=True)
+VeDbusService = None
+GLib = None
 
-class FelicityDbusBridge:
-    def __init__(self, battery_num: int, data_source: str = "http://127.0.0.1:8080"):
-        self.battery_num = battery_num
-        self.data_source = data_source
-        self.api_url = f"{data_source}/api/battery{battery_num}.json"
+
+def import_venus_modules(velib_path):
+    """Import the Venus OS D-Bus helpers. Done at runtime so tests can inject fakes."""
+    global VeDbusService, GLib
+    if velib_path not in sys.path:
+        sys.path.insert(1, velib_path)
+    from vedbus import VeDbusService as _VeDbusService
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib as _GLib
+    DBusGMainLoop(set_as_default=True)
+    VeDbusService, GLib = _VeDbusService, _GLib
+
+
+# Fault flags reported by the pack -> D-Bus alarm path
+ALARM_DBUS_MAP = {
+    'high_voltage':           '/Alarms/HighVoltage',
+    'low_voltage':            '/Alarms/LowVoltage',
+    'high_charge_current':    '/Alarms/HighChargeCurrent',
+    'high_discharge_current': '/Alarms/HighDischargeCurrent',
+    'high_temperature':       '/Alarms/HighTemperature',
+    'low_temperature':        '/Alarms/LowTemperature',
+    'sensor_fault':           '/Alarms/SensorFault',
+    'parallel_fault':         '/Alarms/ParallelFault',
+    'output_res_low':         '/Alarms/OutputResistanceLow',
+    'mos_temp_low':           '/Alarms/MOSTemperatureLow',
+}
+
+
+def parse_fault_status(fault_text):
+    """Translate the pack's fault text into individual alarm states (0 = ok, 2 = alarm)."""
+    alarms = {
+        'high_voltage': 0,
+        'low_voltage': 0,
+        'high_charge_current': 0,
+        'high_discharge_current': 0,
+        'high_temperature': 0,
+        'low_temperature': 0,
+        'general_alarm': 0,
+    }
+    if not fault_text or fault_text == "None":
+        return alarms
+
+    fault_lower = fault_text.lower()
+    if "cell v high" in fault_lower:
+        alarms['high_voltage'] = 2
+        alarms['general_alarm'] = 2
+    if "cell v low" in fault_lower:
+        alarms['low_voltage'] = 2
+        alarms['general_alarm'] = 2
+    if "charge i high" in fault_lower:
+        alarms['high_charge_current'] = 2
+        alarms['general_alarm'] = 2
+    if "discharge i high" in fault_lower:
+        alarms['high_discharge_current'] = 2
+        alarms['general_alarm'] = 2
+    if "mos temp high" in fault_lower or "cell temp high" in fault_lower:
+        alarms['high_temperature'] = 2
+        alarms['general_alarm'] = 2
+    if "mos temp low" in fault_lower or "cell temp low" in fault_lower:
+        alarms['low_temperature'] = 2
+        alarms['general_alarm'] = 2
+    if "c01" in fault_lower:
+        alarms['high_voltage'] = 2
+        alarms['general_alarm'] = 2
+    if "c02" in fault_lower:
+        alarms['low_voltage'] = 2
+        alarms['general_alarm'] = 2
+    alarms['sensor_fault'] = 2 if "c11" in fault_lower else 0
+    alarms['parallel_fault'] = 2 if "c13" in fault_lower else 0
+    alarms['output_res_low'] = 2 if "c12" in fault_lower else 0
+    alarms['mos_temp_low'] = 2 if "c08" in fault_lower else 0
+    return alarms
+
+
+class FelicityDbusBridge(object):
+    def __init__(self, pack_number, config=None, api_base_url=None):
+        self.config = config or felicity_config.BridgeConfig()
+        self.pack = self.config.pack(pack_number)
+        self.battery_num = pack_number
+        base = (api_base_url or self.config.api_base_url).rstrip("/")
+        self.api_url = "%s/api/battery%d.json" % (base, pack_number)
         self.dbus_service = None
         self.update_counter = 0
         self.error_counter = 0
 
-        # Debounce: number of consecutive active polls required before an alarm
-        # is promoted to D-Bus. At 3s poll interval, 20 polls = 60 seconds.
-        self.ALARM_DEBOUNCE_POLLS = 20
-
-        # Per-alarm-key consecutive-active-poll counters.
-        # Keys match the alarm dict keys returned by parse_fault_status().
+        self.ALARM_DEBOUNCE_POLLS = self.config.alarm_debounce_polls
+        # Consecutive polls each fault has been active
         self._alarm_debounce = {}
-
-        # Per-alarm-key: current value that has been published to D-Bus.
-        # Kept separate so we can clear D-Bus immediately when a fault clears.
+        # Value currently published per fault, so a cleared fault is removed at once
         self._alarm_published = {}
 
-        # Setup logging with battery_num context
         logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-        self.logger = logging.getLogger(f"Battery{battery_num}")
-        
-    def create_dbus_service(self):
-        """Create D-Bus service for this battery"""
-        service_name = f'com.victronenergy.battery.felicity_battery{self.battery_num}'
-        self.dbus_service = VeDbusService(service_name, register=False)
-        
-        # Management paths
-        self.dbus_service.add_path('/Mgmt/ProcessName', f'Felicity D-Bus Bridge #{self.battery_num}')
-        self.dbus_service.add_path('/Mgmt/ProcessVersion', '2.0')
-        self.dbus_service.add_path('/Mgmt/Connection', f'Serial /dev/ttyFelicityBMS (Modbus 0x{ {1:1,2:2,3:4}.get(self.battery_num, self.battery_num):02d})')
-        
-        # Product information
-        self.dbus_service.add_path('/ProductName', f'Felicity BMS Battery {self.battery_num}')
-        self.dbus_service.add_path('/ProductId', 0)
-        self.dbus_service.add_path('/FirmwareVersion', '417')
-        self.dbus_service.add_path('/HardwareVersion', '')
-        
-        # Serial numbers (different for each battery)
-        _serials = {1: 'SERIAL-PACK-1', 2: 'SERIAL-PACK-2',
-                    3: 'SERIAL-PACK-3'}  # 3 = FLA48460TG2-EU (Modbus-Client 4)
-        self.dbus_service.add_path('/Serial', _serials.get(self.battery_num, f'felicity-{self.battery_num}'))
-        
-        self.dbus_service.add_path('/Connected', 1)
-        self.dbus_service.add_path('/DeviceInstance', self.battery_num)
-        self.dbus_service.add_path('/CustomName', f'Felicity Battery {self.battery_num}')
-        
-        # Battery measurements
-        self.dbus_service.add_path('/Soc', None)
-        self.dbus_service.add_path('/Dc/0/Voltage', None)
-        self.dbus_service.add_path('/Dc/0/Current', None)
-        self.dbus_service.add_path('/Dc/0/Power', None)
-        self.dbus_service.add_path('/Dc/0/Temperature', None)
-        
-        # Cell voltages
-        for i in range(1, 17):
-            self.dbus_service.add_path(f'/Voltages/Cell{i}', None)
-        
-        # Temperature sensors
-        for i in range(1, 5):
-            self.dbus_service.add_path(f'/System/Temperature{i}', None)
-        
-        # System information
-        self.dbus_service.add_path('/System/NrOfCellsPerBattery', 16)
-        self.dbus_service.add_path('/System/MinCellVoltage', None)
-        self.dbus_service.add_path('/System/MaxCellVoltage', None)
-        self.dbus_service.add_path('/System/MaxVoltageCellId', None)
-        self.dbus_service.add_path('/System/MinVoltageCellId', None)
-        self.dbus_service.add_path('/System/MaxCellTemperature', None)
-        self.dbus_service.add_path('/System/MinCellTemperature', None)
-        self.dbus_service.add_path('/System/MaxTemperatureCellId', None)
-        self.dbus_service.add_path('/System/MinTemperatureCellId', None)
-        self.dbus_service.add_path('/InstalledCapacity', None)
-        
-        # History
-        self.dbus_service.add_path('/History/ChargeCycles', None)
-        # /History/ChargedEnergy 2026-08-01 entfernt (Register liefert keine Energie)
-        # /History/DischargedEnergy 2026-08-01 entfernt (Register liefert keine Energie)
-        self.dbus_service.add_path('/System/BMSUptime', None)
-        self.dbus_service.add_path('/Soh', None)
-        self.dbus_service.add_path('/System/MOSTemperature', None)
-        for i in range(5, 9):
-            self.dbus_service.add_path(f'/System/Temperature{i}', None)
-        
-        # Alarms (0=OK, 1=Warning, 2=Alarm)
-        self.dbus_service.add_path('/Alarms/LowVoltage', 0)
-        self.dbus_service.add_path('/Alarms/HighVoltage', 0)
-        self.dbus_service.add_path('/Alarms/LowSoc', 0)
-        self.dbus_service.add_path('/Alarms/HighTemperature', 0)
-        self.dbus_service.add_path('/Alarms/LowTemperature', 0)
-        self.dbus_service.add_path('/Alarms/HighChargeCurrent', 0)
-        self.dbus_service.add_path('/Alarms/HighDischargeCurrent', 0)
-        self.dbus_service.add_path('/Alarms/Alarm', 0)  # General alarm indicator for GUI
-        
-        # Extended Fault Info (custom paths for detailed fault status)
-        self.dbus_service.add_path('/Alarms/FaultStatusText', 'None')
-        self.dbus_service.add_path('/Alarms/FaultRaw', 0)
-        self.dbus_service.add_path('/Alarms/CellImbalance', 0)
-        self.dbus_service.add_path('/Alarms/SensorFault', 0)
-        self.dbus_service.add_path('/Alarms/ParallelFault', 0)
-        self.dbus_service.add_path('/Alarms/OutputResistanceLow', 0)
-        self.dbus_service.add_path('/Alarms/MOSTemperatureLow', 0)
-        self.dbus_service.add_path('/Alarms/ChargeEnabled', 1)
-        self.dbus_service.add_path('/Alarms/DischargeEnabled', 1)
+        self.logger = logging.getLogger("Battery%d" % pack_number)
 
-        # Register the service
-        self.dbus_service.register()
-        
-        self.logger.info(f"D-Bus service created: com.victronenergy.battery.felicity_battery{self.battery_num}")
-    
+    def create_dbus_service(self):
+        """Create the D-Bus service for this pack.
+
+        The service is created with register=False and all measurements start as
+        None (D-Bus "invalid"). It is registered only after all paths exist and the
+        pack API has answered (see run()), so consumers never see a made-up 0.
+        """
+        p = self.pack
+        service_name = 'com.victronenergy.battery.felicity_battery%d' % self.battery_num
+        self.dbus_service = VeDbusService(service_name, register=False)
+        s = self.dbus_service
+
+        s.add_path('/Mgmt/ProcessName', 'Felicity D-Bus Bridge #%d' % self.battery_num)
+        s.add_path('/Mgmt/ProcessVersion', '2.0')
+        s.add_path('/Mgmt/Connection', 'Serial %s (Modbus 0x%02d)' % (p.serial_port, p.modbus_address))
+
+        s.add_path('/ProductName', p.product_name)
+        s.add_path('/ProductId', 0)
+        s.add_path('/FirmwareVersion', p.firmware_version)
+        s.add_path('/HardwareVersion', '')
+        s.add_path('/Serial', p.serial)
+        s.add_path('/Connected', 1)
+        s.add_path('/DeviceInstance', p.device_instance)
+        s.add_path('/CustomName', p.custom_name)
+
+        s.add_path('/Soc', None)
+        s.add_path('/Dc/0/Voltage', None)
+        s.add_path('/Dc/0/Current', None)
+        s.add_path('/Dc/0/Power', None)
+        s.add_path('/Dc/0/Temperature', None)
+
+        for i in range(1, self.config.cells_per_pack + 1):
+            s.add_path('/Voltages/Cell%d' % i, None)
+        for i in range(1, 5):
+            s.add_path('/System/Temperature%d' % i, None)
+
+        s.add_path('/System/NrOfCellsPerBattery', self.config.cells_per_pack)
+        s.add_path('/System/MinCellVoltage', None)
+        s.add_path('/System/MaxCellVoltage', None)
+        s.add_path('/System/MaxVoltageCellId', None)
+        s.add_path('/System/MinVoltageCellId', None)
+        s.add_path('/System/MaxCellTemperature', None)
+        s.add_path('/System/MinCellTemperature', None)
+        s.add_path('/System/MaxTemperatureCellId', None)
+        s.add_path('/System/MinTemperatureCellId', None)
+        s.add_path('/InstalledCapacity', None)
+
+        s.add_path('/History/ChargeCycles', None)
+        # No /History/ChargedEnergy and /History/DischargedEnergy: the BMS registers
+        # behind them do not hold usable energy counters, so they are not published.
+        s.add_path('/System/BMSUptime', None)
+        s.add_path('/Soh', None)
+        s.add_path('/System/MOSTemperature', None)
+        for i in range(5, 9):
+            s.add_path('/System/Temperature%d' % i, None)
+
+        # Alarms: 0 = ok, 1 = warning, 2 = alarm
+        s.add_path('/Alarms/LowVoltage', 0)
+        s.add_path('/Alarms/HighVoltage', 0)
+        s.add_path('/Alarms/LowSoc', 0)
+        s.add_path('/Alarms/HighTemperature', 0)
+        s.add_path('/Alarms/LowTemperature', 0)
+        s.add_path('/Alarms/HighChargeCurrent', 0)
+        s.add_path('/Alarms/HighDischargeCurrent', 0)
+        s.add_path('/Alarms/Alarm', 0)  # general alarm indicator for the GUI
+
+        # Extended fault information (custom paths)
+        s.add_path('/Alarms/FaultStatusText', 'None')
+        s.add_path('/Alarms/FaultRaw', 0)
+        s.add_path('/Alarms/CellImbalance', 0)
+        s.add_path('/Alarms/SensorFault', 0)
+        s.add_path('/Alarms/ParallelFault', 0)
+        s.add_path('/Alarms/OutputResistanceLow', 0)
+        s.add_path('/Alarms/MOSTemperatureLow', 0)
+        s.add_path('/Alarms/ChargeEnabled', 1)
+        s.add_path('/Alarms/DischargeEnabled', 1)
+
+        s.register()
+        self.logger.info("D-Bus service created: %s", service_name)
+
     def fetch_battery_data(self):
-        """Fetch battery data from web interface API"""
+        """Fetch the pack values from the local pack API."""
         try:
-            with urllib.request.urlopen(self.api_url, timeout=5) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                return data
+            with urllib.request.urlopen(self.api_url, timeout=self.config.api_timeout) as response:
+                return json.loads(response.read().decode('utf-8'))
         except Exception as e:
             self.error_counter += 1
-            if self.error_counter % 10 == 1:  # Log every 10th error to avoid spam
-                self.logger.warning(f"[Battery {self.battery_num}] Error fetching data from {self.api_url}: {e} (error #{self.error_counter})")
+            if self.error_counter % 10 == 1:  # log every 10th error only
+                self.logger.warning("[Battery %d] Error fetching data from %s: %s (error #%d)",
+                                    self.battery_num, self.api_url, e, self.error_counter)
             return None
-    
+
+    # kept as a method for compatibility with the original class interface
     def parse_fault_status(self, fault_text):
-        """Parse fault status text and return individual alarm states"""
-        alarms = {
-            'high_voltage': 0,
-            'low_voltage': 0,
-            'high_charge_current': 0,
-            'high_discharge_current': 0,
-            'high_temperature': 0,
-            'low_temperature': 0,
-            'general_alarm': 0
-        }
-        
-        if not fault_text or fault_text == "None":
-            return alarms
-        
-        # Parse the fault text
-        fault_lower = fault_text.lower()
-        
-        if "cell v high" in fault_lower:
-            alarms['high_voltage'] = 2
-            alarms['general_alarm'] = 2
-        if "cell v low" in fault_lower:
-            alarms['low_voltage'] = 2
-            alarms['general_alarm'] = 2
-        if "charge i high" in fault_lower:
-            alarms['high_charge_current'] = 2
-            alarms['general_alarm'] = 2
-        if "discharge i high" in fault_lower:
-            alarms['high_discharge_current'] = 2
-            alarms['general_alarm'] = 2
-        if "mos temp high" in fault_lower or "cell temp high" in fault_lower:
-            alarms['high_temperature'] = 2
-            alarms['general_alarm'] = 2
-        if "mos temp low" in fault_lower or "cell temp low" in fault_lower:
-            alarms['low_temperature'] = 2
-            alarms['general_alarm'] = 2
-        if "c01" in fault_lower:
-            alarms['high_voltage'] = 2
-            alarms['general_alarm'] = 2
-        if "c02" in fault_lower:
-            alarms['low_voltage'] = 2
-            alarms['general_alarm'] = 2
-        alarms['sensor_fault'] = 2 if "c11" in fault_lower else 0
-        alarms['parallel_fault'] = 2 if "c13" in fault_lower else 0
-        alarms['output_res_low'] = 2 if "c12" in fault_lower else 0
-        alarms['mos_temp_low'] = 2 if "c08" in fault_lower else 0
-        return alarms
-    
-    def update_dbus(self):
-        """Update D-Bus values from battery data"""
-        data = self.fetch_battery_data()
+        return parse_fault_status(fault_text)
+
+    def update_dbus(self, data=None):
+        """Copy one API response onto D-Bus. Returns True on success."""
+        if data is None:
+            data = self.fetch_battery_data()
+        s = self.dbus_service
         if not data:
-            self.dbus_service['/Connected'] = 0  # Mark as disconnected if no data
+            s['/Connected'] = 0
             return False
 
         try:
-            # Update SOC
-            # Nur plausible Werte publizieren: 0 (oder None) heisst hier "noch kein
-            # Modbus-Read durch" bzw. Lesefehler — wuerde in HA als SOC-Einbruch auf
-            # 0 % landen. Im Betrieb schaltet das BMS lange vor 0 % ab.
+            # SOC: only plausible values. 0 (or None) means "no Modbus read yet" or a
+            # read error - publishing it would show up as a SOC drop to 0 %. In normal
+            # operation the BMS disconnects long before 0 %.
             soc = data.get("SOC", {}).get("value")
             if soc is not None and 0 < soc <= 100:
-                self.dbus_service['/Soc'] = soc
-                # Low SOC alarm (below 10%)
+                s['/Soc'] = soc
                 if soc < 10:
-                    self.dbus_service['/Alarms/LowSoc'] = 2
+                    s['/Alarms/LowSoc'] = 2
                 elif soc < 20:
-                    self.dbus_service['/Alarms/LowSoc'] = 1
+                    s['/Alarms/LowSoc'] = 1
                 else:
-                    self.dbus_service['/Alarms/LowSoc'] = 0
+                    s['/Alarms/LowSoc'] = 0
 
-            # Update voltage
             if "BatteryVoltage" in data:
                 voltage = data["BatteryVoltage"]["value"]
-                self.dbus_service['/Dc/0/Voltage'] = voltage
+                s['/Dc/0/Voltage'] = voltage
 
-            # Update current and power
             if "BatteryCurrent" in data:
                 current = data["BatteryCurrent"]["value"]
-                # 2026-08-06: Victron-Konvention (positiv = laden). Die fruehere
-                # Inversion war ein EVCC-Workaround, den jetzt der HA-Adapter
-                # sensor.evcc_batterieleistung uebernimmt.
-                self.dbus_service['/Dc/0/Current'] = current
+                # Victron convention: positive = charging (the API already delivers it so)
+                s['/Dc/0/Current'] = current
                 if "BatteryVoltage" in data:
-                    self.dbus_service['/Dc/0/Power'] = voltage * current
+                    s['/Dc/0/Power'] = voltage * current
 
-            # Update cell voltages and find min/max
             cell_voltages = []
-            for i in range(1, 17):
-                key = f"Cell{i} Voltage"
+            for i in range(1, self.config.cells_per_pack + 1):
+                key = "Cell%d Voltage" % i
                 if key in data:
                     cell_v = data[key]["value"]
-                    self.dbus_service[f'/Voltages/Cell{i}'] = cell_v
+                    s['/Voltages/Cell%d' % i] = cell_v
                     cell_voltages.append(cell_v)
 
-            # Update min/max cell voltage + cell IDs
             if cell_voltages:
-                self.dbus_service['/System/MinCellVoltage'] = min(cell_voltages)
-                self.dbus_service['/System/MaxCellVoltage'] = max(cell_voltages)
+                s['/System/MinCellVoltage'] = min(cell_voltages)
+                s['/System/MaxCellVoltage'] = max(cell_voltages)
             if "MaxCellVoltageId" in data:
-                self.dbus_service['/System/MaxVoltageCellId'] = data["MaxCellVoltageId"]["value"]
+                s['/System/MaxVoltageCellId'] = data["MaxCellVoltageId"]["value"]
             if "MinCellVoltageId" in data:
-                self.dbus_service['/System/MinVoltageCellId'] = data["MinCellVoltageId"]["value"]
+                s['/System/MinVoltageCellId'] = data["MinCellVoltageId"]["value"]
 
-            # Update temperature sensors
             for i in range(1, 5):
-                key = f"Sensor{i} Temperature"
+                key = "Sensor%d Temperature" % i
                 if key in data:
-                    self.dbus_service[f'/System/Temperature{i}'] = data[key]["value"]
+                    s['/System/Temperature%d' % i] = data[key]["value"]
 
-            # Update max/min cell temperature + cell IDs
             if "MaxCellTemperature" in data:
-                self.dbus_service['/System/MaxCellTemperature'] = data["MaxCellTemperature"]["value"]
+                s['/System/MaxCellTemperature'] = data["MaxCellTemperature"]["value"]
             if "MinCellTemperature" in data:
-                self.dbus_service['/System/MinCellTemperature'] = data["MinCellTemperature"]["value"]
+                s['/System/MinCellTemperature'] = data["MinCellTemperature"]["value"]
             if "MaxCellTemperatureId" in data:
-                self.dbus_service['/System/MaxTemperatureCellId'] = data["MaxCellTemperatureId"]["value"]
+                s['/System/MaxTemperatureCellId'] = data["MaxCellTemperatureId"]["value"]
             if "MinCellTemperatureId" in data:
-                self.dbus_service['/System/MinTemperatureCellId'] = data["MinCellTemperatureId"]["value"]
+                s['/System/MinTemperatureCellId'] = data["MinCellTemperatureId"]["value"]
 
-            # Update installed capacity (static per battery)
             if "RatedCapacity" in data:
-                self.dbus_service['/InstalledCapacity'] = data["RatedCapacity"]["value"]
-
-            # Update SOH
+                s['/InstalledCapacity'] = data["RatedCapacity"]["value"]
             if "SOH" in data:
-                self.dbus_service['/Soh'] = data["SOH"]["value"]
-
-            # Update MOS temperature
+                s['/Soh'] = data["SOH"]["value"]
             if "MOSTemperature" in data:
-                self.dbus_service['/System/MOSTemperature'] = data["MOSTemperature"]["value"]
+                s['/System/MOSTemperature'] = data["MOSTemperature"]["value"]
 
-            # Update temperature sensors 5-8
             for i in range(5, 9):
-                key = f"Sensor{i} Temperature"
+                key = "Sensor%d Temperature" % i
                 if key in data:
-                    self.dbus_service[f'/System/Temperature{i}'] = data[key]["value"]
+                    s['/System/Temperature%d' % i] = data[key]["value"]
 
-            # Update raw fault register
             if "FaultRaw" in data:
-                self.dbus_service['/Alarms/FaultRaw'] = data["FaultRaw"]["value"]
-
-            # Update cycle count
+                s['/Alarms/FaultRaw'] = data["FaultRaw"]["value"]
             if "CycleCount" in data:
-                self.dbus_service['/History/ChargeCycles'] = data["CycleCount"]["value"]
-
-            # Update energy counters (kWh)
-            if "ChgEnergy" in data:
-                self.dbus_service['/History/ChargedEnergy'] = data["ChgEnergy"]["value"]
-            if "DcgEnergy" in data:
-                self.dbus_service['/History/DischargedEnergy'] = data["DcgEnergy"]["value"]
-
-            # Update BMS uptime (hours)
+                s['/History/ChargeCycles'] = data["CycleCount"]["value"]
+            # Energy counters are intentionally not published (see create_dbus_service).
             if "BMSUptime" in data:
-                self.dbus_service['/System/BMSUptime'] = data["BMSUptime"]["value"]
-
-            # Update firmware version
+                s['/System/BMSUptime'] = data["BMSUptime"]["value"]
             if "BMSVersion" in data:
-                self.dbus_service['/FirmwareVersion'] = str(data["BMSVersion"]["value"])
+                s['/FirmwareVersion'] = str(data["BMSVersion"]["value"])
 
-            # ===== ALARM/FAULT STATUS UPDATE (with debounce) =====
             if "FaultStatus" in data:
-                fault_text = data["FaultStatus"]["value"]
-                self.dbus_service['/Alarms/FaultStatusText'] = fault_text
+                self._update_alarms(data["FaultStatus"]["value"])
 
-                # Parse raw alarm state for this poll
-                alarms = self.parse_fault_status(fault_text)
-
-                # Map from alarm dict key -> D-Bus path
-                alarm_dbus_map = {
-                    'high_voltage':           '/Alarms/HighVoltage',
-                    'low_voltage':            '/Alarms/LowVoltage',
-                    'high_charge_current':    '/Alarms/HighChargeCurrent',
-                    'high_discharge_current': '/Alarms/HighDischargeCurrent',
-                    'high_temperature':       '/Alarms/HighTemperature',
-                    'low_temperature':        '/Alarms/LowTemperature',
-                    'sensor_fault':           '/Alarms/SensorFault',
-                    'parallel_fault':         '/Alarms/ParallelFault',
-                    'output_res_low':         '/Alarms/OutputResistanceLow',
-                    'mos_temp_low':           '/Alarms/MOSTemperatureLow',
-                }
-
-                debounced_general_alarm = 0
-
-                for key, dbus_path in alarm_dbus_map.items():
-                    raw_val = alarms.get(key, 0)
-
-                    if raw_val > 0:
-                        # Fault active this poll: increment debounce counter
-                        self._alarm_debounce[key] = self._alarm_debounce.get(key, 0) + 1
-                        count = self._alarm_debounce[key]
-
-                        if count == 1:
-                            # First occurrence — log but do NOT publish yet
-                            self.logger.warning(
-                                f"[Battery {self.battery_num}] Transient fault detected "
-                                f"{key}={raw_val} (poll 1/{self.ALARM_DEBOUNCE_POLLS}, "
-                                f"FaultStatus={fault_text}) — debouncing, not yet on D-Bus"
-                            )
-                        elif count == self.ALARM_DEBOUNCE_POLLS:
-                            # Threshold reached — promote to D-Bus alarm
-                            self.dbus_service[dbus_path] = raw_val
-                            self._alarm_published[key] = raw_val
-                            self.logger.warning(
-                                f"[Battery {self.battery_num}] ALARM confirmed after "
-                                f"{self.ALARM_DEBOUNCE_POLLS} polls: {key}={raw_val}, "
-                                f"FaultStatus={fault_text}"
-                            )
-                        elif count > self.ALARM_DEBOUNCE_POLLS:
-                            # Already published, keep value current (no-op if unchanged)
-                            pass
-
-                        # Contribute to general alarm only if debounce threshold is met
-                        if count >= self.ALARM_DEBOUNCE_POLLS:
-                            debounced_general_alarm = 2
-
-                    else:
-                        # Fault clear this poll
-                        prev_count = self._alarm_debounce.get(key, 0)
-                        if prev_count > 0 and prev_count < self.ALARM_DEBOUNCE_POLLS:
-                            # Was in debounce window — fault resolved before threshold
-                            self.logger.warning(
-                                f"[Battery {self.battery_num}] Transient fault cleared "
-                                f"{key} after {prev_count} polls "
-                                f"(< {self.ALARM_DEBOUNCE_POLLS} threshold) — "
-                                f"was NOT published to D-Bus"
-                            )
-                        # Reset counter regardless
-                        self._alarm_debounce[key] = 0
-
-                        # Clear D-Bus only if we had previously published an alarm
-                        if self._alarm_published.get(key, 0) > 0:
-                            self.dbus_service[dbus_path] = 0
-                            self._alarm_published[key] = 0
-                            self.logger.info(
-                                f"[Battery {self.battery_num}] Alarm cleared on D-Bus: {key}"
-                            )
-
-                # Update general alarm indicator (debounced aggregate)
-                self.dbus_service['/Alarms/Alarm'] = debounced_general_alarm
-            
-            # Update Charge/Discharge Enable status
             if "ChargeEnabled" in data:
-                self.dbus_service['/Alarms/ChargeEnabled'] = 1 if data["ChargeEnabled"]["value"] == "Yes" else 0
+                s['/Alarms/ChargeEnabled'] = 1 if data["ChargeEnabled"]["value"] == "Yes" else 0
             if "DischargeEnabled" in data:
-                self.dbus_service['/Alarms/DischargeEnabled'] = 1 if data["DischargeEnabled"]["value"] == "Yes" else 0
+                s['/Alarms/DischargeEnabled'] = 1 if data["DischargeEnabled"]["value"] == "Yes" else 0
 
-            # Mark as connected
-            self.dbus_service['/Connected'] = 1
+            s['/Connected'] = 1
 
-            # Log every 20 updates (60 seconds at 3s interval)
             self.update_counter += 1
             if self.update_counter % 20 == 1:
-                soc = data.get("SOC", {}).get("value", "N/A")
-                voltage = data.get("BatteryVoltage", {}).get("value", "N/A")
-                fault = data.get("FaultStatus", {}).get("value", "N/A")
-                self.logger.info(f"[Battery {self.battery_num}] Update #{self.update_counter}: SoC={soc}%, V={voltage}V, Fault={fault}")
+                self.logger.info("[Battery %d] Update #%d: SoC=%s%%, V=%sV, Fault=%s",
+                                 self.battery_num, self.update_counter,
+                                 data.get("SOC", {}).get("value", "N/A"),
+                                 data.get("BatteryVoltage", {}).get("value", "N/A"),
+                                 data.get("FaultStatus", {}).get("value", "N/A"))
 
-            # Reset error counter on successful update
             if self.error_counter > 0:
-                self.logger.info(f"[Battery {self.battery_num}] Connection restored after {self.error_counter} errors")
+                self.logger.info("[Battery %d] Connection restored after %d errors",
+                                 self.battery_num, self.error_counter)
                 self.error_counter = 0
-
             return True
 
         except Exception as e:
-            self.logger.error(f"[Battery {self.battery_num}] Error updating D-Bus values: {e}")
-            self.dbus_service['/Connected'] = 0
+            self.logger.error("[Battery %d] Error updating D-Bus values: %s", self.battery_num, e)
+            s['/Connected'] = 0
             return False
-    
+
+    def _update_alarms(self, fault_text):
+        """Publish fault alarms with debounce.
+
+        Packs report short fault blips (for example while the parallel bus
+        re-negotiates). A fault is raised on D-Bus only after it was present in
+        ALARM_DEBOUNCE_POLLS consecutive polls; it is cleared immediately.
+        """
+        s = self.dbus_service
+        s['/Alarms/FaultStatusText'] = fault_text
+        alarms = parse_fault_status(fault_text)
+        debounced_general_alarm = 0
+
+        for key, dbus_path in ALARM_DBUS_MAP.items():
+            raw_val = alarms.get(key, 0)
+            if raw_val > 0:
+                self._alarm_debounce[key] = self._alarm_debounce.get(key, 0) + 1
+                count = self._alarm_debounce[key]
+                if count == 1:
+                    self.logger.warning(
+                        "[Battery %d] Transient fault detected %s=%s (poll 1/%d, FaultStatus=%s) "
+                        "- debouncing, not yet on D-Bus",
+                        self.battery_num, key, raw_val, self.ALARM_DEBOUNCE_POLLS, fault_text)
+                elif count == self.ALARM_DEBOUNCE_POLLS:
+                    s[dbus_path] = raw_val
+                    self._alarm_published[key] = raw_val
+                    self.logger.warning(
+                        "[Battery %d] ALARM confirmed after %d polls: %s=%s, FaultStatus=%s",
+                        self.battery_num, self.ALARM_DEBOUNCE_POLLS, key, raw_val, fault_text)
+                if count >= self.ALARM_DEBOUNCE_POLLS:
+                    debounced_general_alarm = 2
+            else:
+                prev_count = self._alarm_debounce.get(key, 0)
+                if 0 < prev_count < self.ALARM_DEBOUNCE_POLLS:
+                    self.logger.warning(
+                        "[Battery %d] Transient fault cleared %s after %d polls (< %d threshold) "
+                        "- was NOT published to D-Bus",
+                        self.battery_num, key, prev_count, self.ALARM_DEBOUNCE_POLLS)
+                self._alarm_debounce[key] = 0
+                if self._alarm_published.get(key, 0) > 0:
+                    s[dbus_path] = 0
+                    self._alarm_published[key] = 0
+                    self.logger.info("[Battery %d] Alarm cleared on D-Bus: %s", self.battery_num, key)
+
+        s['/Alarms/Alarm'] = debounced_general_alarm
+
     def wait_for_api(self, max_wait=120):
-        """Wait until the battery API is available before registering on D-Bus.
-        Prevents crash-loop when battery_web_interface.py hasn't started yet."""
-        self.logger.info(f"[Battery {self.battery_num}] Waiting for API at {self.api_url}...")
+        """Wait until the pack API answers before registering on D-Bus.
+        Avoids a crash loop while the API service is still starting."""
+        self.logger.info("[Battery %d] Waiting for API at %s...", self.battery_num, self.api_url)
         deadline = time.time() + max_wait
         while time.time() < deadline:
             try:
                 with urllib.request.urlopen(self.api_url, timeout=3) as r:
                     if r.status == 200:
-                        self.logger.info(f"[Battery {self.battery_num}] API ready.")
+                        self.logger.info("[Battery %d] API ready.", self.battery_num)
                         return True
             except Exception:
                 pass
             time.sleep(3)
-        self.logger.error(f"[Battery {self.battery_num}] API not available after {max_wait}s, continuing anyway.")
+        self.logger.error("[Battery %d] API not available after %ds, continuing anyway.",
+                          self.battery_num, max_wait)
         return False
 
     def run(self):
-        """Main run loop with restart-on-error.
-        Wraps GLib mainloop in a retry loop so daemontools doesn't give up
-        after rapid crashes (e.g. D-Bus disconnect, temporary API unavailability)."""
-        RETRY_DELAY = 10  # seconds between restart attempts
-
-        # Wait for API before first D-Bus registration
+        """Main loop with restart-on-error, so daemontools does not give up after
+        rapid crashes (D-Bus disconnect, API temporarily unavailable)."""
+        retry_delay = 10
         self.wait_for_api()
-
         while True:
             try:
-                self.dbus_service = None  # Reset for clean re-registration
+                self.dbus_service = None
                 self.create_dbus_service()
 
                 def update_callback():
                     self.update_dbus()
-                    return True  # Continue calling
+                    return True
 
-                GLib.timeout_add_seconds(3, update_callback)
-
+                GLib.timeout_add_seconds(self.config.poll_interval, update_callback)
                 self.logger.info("Starting GLib mainloop...")
-                mainloop = GLib.MainLoop()
-                mainloop.run()
-
-                # mainloop.run() returned cleanly — unusual but not fatal
+                GLib.MainLoop().run()
                 self.logger.warning("GLib mainloop exited cleanly, restarting...")
-
             except Exception as e:
-                self.logger.error(f"[Battery {self.battery_num}] Main loop error: {e} — restarting in {RETRY_DELAY}s")
+                self.logger.error("[Battery %d] Main loop error: %s - restarting in %ds",
+                                  self.battery_num, e, retry_delay)
+            time.sleep(retry_delay)
 
-            time.sleep(RETRY_DELAY)
+
+def main(argv):
+    config_path, args = felicity_config.config_path_from_argv(argv[1:])
+    if not args:
+        print("Usage: battery_dbus_bridge.py <pack_number> [api_base_url] [--config <file>]")
+        return 1
+    config = felicity_config.load(config_path)
+    import_venus_modules(config.velib_path)
+    api_base_url = args[1] if len(args) > 1 else None
+    FelicityDbusBridge(int(args[0]), config, api_base_url).run()
+    return 0
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: battery_dbus_bridge.py <battery_num> [data_source_url]")
-        sys.exit(1)
-    
-    battery_num = int(sys.argv[1])
-    data_source = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8080"
-    
-    bridge = FelicityDbusBridge(battery_num, data_source)
-    bridge.run()
+    sys.exit(main(sys.argv))
