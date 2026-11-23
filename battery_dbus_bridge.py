@@ -170,7 +170,7 @@ class FelicityDbusBridge(object):
         s.add_path('/History/ChargeCycles', None)
         # No /History/ChargedEnergy and /History/DischargedEnergy: the BMS registers
         # behind them do not hold usable energy counters, so they are not published.
-        s.add_path('/System/BMSUptime', None)
+        # No /System/BMSUptime: register 0x440E is not a run-time counter (removed in v1.1.0).
         s.add_path('/Soh', None)
         s.add_path('/System/MOSTemperature', None)
         for i in range(5, 9):
@@ -297,8 +297,6 @@ class FelicityDbusBridge(object):
             if "CycleCount" in data:
                 s['/History/ChargeCycles'] = data["CycleCount"]["value"]
             # Energy counters are intentionally not published (see create_dbus_service).
-            if "BMSUptime" in data:
-                s['/System/BMSUptime'] = data["BMSUptime"]["value"]
             if "BMSVersion" in data:
                 s['/FirmwareVersion'] = str(data["BMSVersion"]["value"])
 

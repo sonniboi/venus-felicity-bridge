@@ -6,6 +6,8 @@
   (`com.victronenergy.battery.felicity_battery1..3`, `…felicity_combined`), captured
   at the same moment via `GetItems`. Use as golden reference: the refactored code must
   produce the same paths and (for these inputs) the same values.
+  Exception: `/System/BMSUptime` was removed from the capture in v1.1.0 (the API
+  responses still contain the field, so the test also proves that it is ignored).
 
 Serial numbers are replaced by placeholders. Captures are a few seconds apart, so
 small differences between API and D-Bus values (current, power) are expected.
