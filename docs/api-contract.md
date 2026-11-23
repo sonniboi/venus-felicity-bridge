@@ -32,7 +32,6 @@ responses captured on a live system are in `tests/fixtures/api_battery*.json`.
 | `MaxCellTemperatureId`, `MinCellTemperatureId` | integer | | `/System/Max/MinTemperatureCellId` | |
 | `SOH` | number | % | `/Soh` | |
 | `CycleCount` | integer | cycles | `/History/ChargeCycles` | maximum |
-| `BMSUptime` | integer | h | `/System/BMSUptime` | |
 | `BMSVersion` | integer/string | | `/FirmwareVersion` | |
 | `MOSTemperature` | number | °C | `/System/MOSTemperature` | |
 | `FaultStatus` | string, `"None"` if ok | | `/Alarms/*` (debounced) | |
@@ -47,10 +46,16 @@ responses captured on a live system are in `tests/fixtures/api_battery*.json`.
 
 ## Fields present but not used
 
-`AlarmRaw`, `AlarmStatus`, `BMSTemperature`, `BatteryModel`, `CellVoltageDelta`,
+`AlarmRaw`, `AlarmStatus`, `BMSTemperature`, `BMSUptime`, `BatteryModel`, `CellVoltageDelta`,
 `ChargeCurrentLimit`, `ChargeVoltageLimit`, `DischargeCurrentLimit`,
 `DischargeVoltageLimit`, `ChargeImmediately`, `FaultCode`, `FaultCodeText`,
 `FirmwareBuild`, `MCU2Version`, `MaxCellVoltage`, `MinCellVoltage`, `SerialNumber`.
+
+Up to v1.0.0 the bridge published `BMSUptime` as `/System/BMSUptime`. The register
+behind it (`0x440E`) is not a run-time counter, so the field is ignored now.
+`FirmwareBuild` (`0x2081`) does not hold a build number either. `CellVoltageDelta`
+must be calculated as highest minus lowest of the 16 cell voltages; register `0x1323`
+is the index of the lowest cell, not a voltage difference.
 
 The charge/discharge limits are deliberately not published: charge voltage and
 current limits (DVCC) are handled by a separate service.
